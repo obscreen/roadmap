@@ -1,0 +1,108 @@
+name: Update Upvotes in GitHub Project
+
+on:
+  issue_comment:
+    types: [created, deleted]
+
+  issues:
+    types: [created, reopened]
+
+  issue_comment_reaction:
+    types: [created, deleted]
+
+jobs:
+  update-upvotes:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Get First Comment on Issue
+        id: get-comment
+        run: |
+          ISSUE_NUMBER=${{ github.event.issue.number }}
+          OWNER=${{ github.repository_owner }}
+          REPO=$(echo "${{ github.repository }}" | cut -d '/' -f2)
+
+          COMMENTS_URL="https://api.github.com/repos/$OWNER/$REPO/issues/$ISSUE_NUMBER/comments"
+          
+          FIRST_COMMENT=$(curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" $COMMENTS_URL | jq '.[0]')
+          
+          if [ "$FIRST_COMMENT" = "null" ]; then
+            echo "No comments found."
+            exit 0
+          fi
+
+          COMMENT_ID=$(echo "$FIRST_COMMENT" | jq -r '.id')
+          echo "COMMENT_ID=$COMMENT_ID" >> $GITHUB_ENV
+
+      - name: Get +1 Reactions Count
+        id: get-reactions
+        run: |
+          REACTIONS_URL="https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/issues/comments/$COMMENT_ID/reactions"
+          
+          REACTIONS=$(curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" -H "Accept: application/vnd.github.squirrel-girl-preview+json" $REACTIONS_URL)
+          
+          PLUS_ONES=$(echo "$REACTIONS" | jq '[.[] | select(.content=="+1")] | length')
+          
+          echo "PLUS_ONES=$PLUS_ONES" >> $GITHUB_ENV
+          echo "Total Upvotes: $PLUS_ONES"
+
+      - name: Get Project Item ID for Issue
+        id: get-project-item
+        run: |
+          PROJECT_ID=3  # Public Roadmap
+          ISSUE_NODE_ID=${{ github.event.issue.node_id }}
+
+          QUERY='
+          {
+            "query": "query { repository(owner: \"${{ github.repository_owner }}\", name: \"${{ github.event.repository.name }}\") { issue(number: ${{ github.event.issue.number }}) { id } } }"
+          }'
+
+          ISSUE_ID=$(curl -s -X POST -H "Authorization: token ${{ secrets.GH_PAT }}" -H "Content-Type: application/json" -d "$QUERY" https://api.github.com/graphql | jq -r '.data.repository.issue.id')
+
+          PROJECT_ITEMS_QUERY='
+          {
+            "query": "query { node(id: \"'$PROJECT_ID'\") { ... on ProjectV2 { items(first: 100) { nodes { id content { ... on Issue { id } } } } } } }"
+          }'
+
+          ITEMS=$(curl -s -X POST -H "Authorization: token ${{ secrets.GH_PAT }}" -H "Content-Type: application/json" -d "$PROJECT_ITEMS_QUERY" https://api.github.com/graphql)
+
+          ITEM_ID=$(echo "$ITEMS" | jq -r '.data.node.items.nodes[] | select(.content.id=="'$ISSUE_ID'") | .id')
+
+          if [ "$ITEM_ID" = "null" ]; then
+            echo "Issue not found in project."
+            exit 0
+          fi
+
+          echo "ITEM_ID=$ITEM_ID" >> $GITHUB_ENV
+
+      - name: Update Upvotes Field in Project
+        run: |
+          PROJECT_ID=3  # Public Roadmap
+          FIELD_NAME="Upvote"
+
+          PROJECT_FIELDS_QUERY='
+          {
+            "query": "query { node(id: \"'$PROJECT_ID'\") { ... on ProjectV2 { fields(first: 100) { nodes { id name } } } } }"
+          }'
+
+          FIELDS=$(curl -s -X POST -H "Authorization: token ${{ secrets.GH_PAT }}" -H "Content-Type: application/json" -d "$PROJECT_FIELDS_QUERY" https://api.github.com/graphql)
+
+          FIELD_ID=$(echo "$FIELDS" | jq -r '.data.node.fields.nodes[] | select(.name=="'$FIELD_NAME'") | .id')
+
+          if [ "$FIELD_ID" = "null" ]; then
+            echo "Field '$FIELD_NAME' not found."
+            exit 0
+          fi
+
+          UPDATE_MUTATION='
+          {
+            "query": "mutation { updateProjectV2ItemFieldValue(input: { projectId: \"'$PROJECT_ID'\", itemId: \"'$ITEM_ID'\", fieldId: \"'$FIELD_ID'\", value: { text: \"'$PLUS_ONES'\" } }) { projectV2Item { id } } }"
+          }'
+
+          curl -s -X POST -H "Authorization: token ${{ secrets.GH_PAT }}" -H "Content-Type: application/json" -d "$UPDATE_MUTATION" https://api.github.com/graphql
+
+          echo "Updated Upvotes to $PLUS_ONES for issue."
+
